@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from spikingjelly.cext.neuron import MultiStepParametricLIFNode
+from spikingjelly.clock_driven.neuron import MultiStepParametricLIFNode
+# import spikingjelly.clock_driven.neuron.MultiStepParametricLIFNode
 from spikingjelly.clock_driven import layer
 
 def conv3x3(in_channels, out_channels):

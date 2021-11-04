@@ -3,23 +3,76 @@ import torch.nn as nn
 from spikingjelly.clock_driven.neuron import MultiStepParametricLIFNode
 from spikingjelly.clock_driven import layer
 
-def conv3x3(in_channels, out_channels):
-    return nn.Sequential(
-        layer.SeqToANNContainer(
+
+#
+# def conv3x3(in_channels, out_channels):
+#     return nn.Sequential(
+#         layer.SeqToANNContainer(
+#             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=1, bias=False),
+#             nn.BatchNorm2d(out_channels),
+#         ),
+#         MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True)
+#     )
+
+
+class conv3x3(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(conv3x3, self).__init__()
+        self.layer = layer.SeqToANNContainer(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=1, bias=False),
             nn.BatchNorm2d(out_channels),
-        ),
-        MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True)
-    )
+        )
+        self.MSPLIF = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True)
 
-def conv1x1(in_channels, out_channels):
-    return nn.Sequential(
-        layer.SeqToANNContainer(
+    def forward(self, x):
+        out = self.layer(x[0])
+        out = self.MSPLIF(out)
+        x[1].append(out)
+        return out, x[1]
+
+
+# def conv1x1(in_channels, out_channels):
+#     return nn.Sequential(
+#         layer.SeqToANNContainer(
+#             nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
+#             nn.BatchNorm2d(out_channels),
+#         ),
+#         MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True)
+#     )
+
+
+class conv1x1(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(conv1x1, self).__init__()
+        self.layer = layer.SeqToANNContainer(
             nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, bias=False),
             nn.BatchNorm2d(out_channels),
-        ),
-        MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True)
-    )
+        )
+        self.MSPLIF = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True)
+
+    def forward(self, x):
+        out = self.layer(x[0])
+        out = self.MSPLIF(out)
+        x[1].append(out)
+        return out, x[1]
+
+class pool(nn.Module):
+    def __init__(self, k_pool):
+        super(pool, self).__init__()
+        self.layer = layer.SeqToANNContainer(nn.MaxPool2d(k_pool, k_pool))
+
+    def forward(self, x):
+        out = self.layer(x[0])
+        return out, x[1]
+class flatt(nn.Module):
+    def __init__(self):
+        super(flatt, self).__init__()
+        self.layer = nn.Flatten(2)
+
+    def forward(self, x):
+        out = self.layer(x[0])
+        return out, x[1]
+
 
 class SEWBlock(nn.Module):
     def __init__(self, in_channels, mid_channels, connect_f=None):
@@ -30,18 +83,19 @@ class SEWBlock(nn.Module):
             conv3x3(mid_channels, in_channels),
         )
 
-    def forward(self, x: torch.Tensor):
-        out = self.conv(x)
+    def forward(self, x):
+        out, temp = self.conv(x)
         if self.connect_f == 'ADD':
-            out += x
+            out += x[0]
         elif self.connect_f == 'AND':
-            out *= x
+            out *= x[0]
         elif self.connect_f == 'IAND':
-            out = x * (1. - out)
+            out = x[0] * (1. - out)
         else:
             raise NotImplementedError(self.connect_f)
 
-        return out
+        return out, temp
+
 
 class PlainBlock(nn.Module):
     def __init__(self, in_channels, mid_channels):
@@ -54,12 +108,12 @@ class PlainBlock(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.conv(x)
 
+
 class BasicBlock(nn.Module):
     def __init__(self, in_channels, mid_channels):
         super(BasicBlock, self).__init__()
         self.conv = nn.Sequential(
             conv3x3(in_channels, mid_channels),
-
             layer.SeqToANNContainer(
                 nn.Conv2d(mid_channels, in_channels, kernel_size=3, padding=1, stride=1, bias=False),
                 nn.BatchNorm2d(in_channels),
@@ -95,7 +149,6 @@ class ResNetN(nn.Module):
 
             in_channels = channels
 
-
             if 'num_blocks' in cfg_dict:
                 num_blocks = cfg_dict['num_blocks']
                 if cfg_dict['block_type'] == 'sew':
@@ -112,9 +165,11 @@ class ResNetN(nn.Module):
 
             if 'k_pool' in cfg_dict:
                 k_pool = cfg_dict['k_pool']
-                conv.append(layer.SeqToANNContainer(nn.MaxPool2d(k_pool, k_pool)))
+                # conv.append(layer.SeqToANNContainer(nn.MaxPool2d(k_pool, k_pool)))
+                conv.append(pool(k_pool))
 
-        conv.append(nn.Flatten(2))
+        # conv.append(nn.Flatten(2))
+        conv.append(flatt())
 
         self.conv = nn.Sequential(*conv)
 
@@ -127,10 +182,13 @@ class ResNetN(nn.Module):
 
         self.out = nn.Linear(out_features, num_classes, bias=True)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         x = x.permute(1, 0, 2, 3, 4)  # [T, N, 2, *, *]
-        x = self.conv(x)
-        return self.out(x.mean(0))
+        firing_num = []
+        out = self.conv((x, firing_num))
+        x = self.out(out[0].mean(0))
+        return x, out[1]
+
 
 def SEWResNet(connect_f):
     layer_list = [

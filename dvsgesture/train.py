@@ -7,12 +7,14 @@ from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 import math
 from torch.cuda import amp
-import smodels, utils
+import smodels_firing_num, utils
 from spikingjelly.clock_driven import functional
 from spikingjelly.datasets import dvs128_gesture
+import pandas as pd
 
 _seed_ = 2020
 import random
+
 random.seed(2020)
 
 torch.manual_seed(_seed_)  # use torch.manual_seed() to seed the RNG for all devices (both CPU and CUDA)
@@ -21,7 +23,9 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 import numpy as np
+
 np.random.seed(_seed_)
+
 
 def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, print_freq, scaler=None, T_train=None):
     model.train()
@@ -81,16 +85,35 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
     return metric_logger.loss.global_avg, metric_logger.acc1.global_avg, metric_logger.acc5.global_avg
 
 
-
 def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test:'):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
+    all_idx = 0
+    save_path = './firing'
     with torch.no_grad():
         for image, target in metric_logger.log_every(data_loader, print_freq, header):
             image = image.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             image = image.float()
-            output = model(image)
+            output, firing_num = model(image)
+
+            lists = []
+            for firing_single in firing_num:
+                sub_list = []
+                firing_single = firing_single.cpu().detach().numpy()
+                for T_ in range(args.T):
+                    sub_list.append(np.sum(firing_single[T_, :, :, :, :]))
+                sub_list.append(firing_single[0, :, :, :, :].shape[0] * firing_single[0, :, :, :, :].shape[1] *
+                                firing_single[0, :, :, :, :].shape[2] * firing_single[0, :, :, :, :].shape[3])
+                lists.append(sub_list)
+            csv = pd.DataFrame(
+                data=lists
+            )
+            if not os.path.exists(save_path):
+                os.makedirs(save_path)
+            csv.to_csv(save_path + os.sep + str(all_idx) + '.csv')
+            all_idx += 1
+
             loss = criterion(output, target)
             functional.reset_net(model)
 
@@ -106,16 +129,17 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test
     print(f' * Acc@1 = {acc1}, Acc@5 = {acc5}, loss = {loss}')
     return loss, acc1, acc5
 
+
 def load_data(dataset_dir, distributed, T):
     # Data loading code
     print("Loading data")
 
     st = time.time()
 
-    dataset_train = dvs128_gesture.DVS128Gesture(root=dataset_dir, train=True, data_type='frame', frames_number=T, split_by='number')
-    dataset_test = dvs128_gesture.DVS128Gesture(root=dataset_dir, train=False, data_type='frame', frames_number=T,
+    dataset_train = dvs128_gesture.DVS128Gesture(root=dataset_dir, train=True, data_type='frame', frames_number=T,
                                                  split_by='number')
-
+    dataset_test = dvs128_gesture.DVS128Gesture(root=dataset_dir, train=False, data_type='frame', frames_number=T,
+                                                split_by='number')
 
     print("Took", time.time() - st)
 
@@ -129,11 +153,16 @@ def load_data(dataset_dir, distributed, T):
 
     return dataset_train, dataset_test, train_sampler, test_sampler
 
-def main(args):
 
+def get_parameter_number(net):
+    total_num = sum(p.numel() for p in net.parameters())
+    trainable_num = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    return {'Total': total_num, 'Trainable': trainable_num}
+
+
+def main(args):
     max_test_acc1 = 0.
     test_acc5_at_max_test_acc1 = 0.
-
 
     train_tb_writer = None
     te_tb_writer = None
@@ -166,7 +195,10 @@ def main(args):
     if not os.path.exists(output_dir):
         utils.mkdir(output_dir)
 
-
+    model = smodels_firing_num.__dict__[args.model](args.connect_f)
+    print("Creating model")
+    print(get_parameter_number(model))
+    print(model)
 
     device = torch.device(args.device)
 
@@ -182,9 +214,6 @@ def main(args):
     data_loader_test = torch.utils.data.DataLoader(
         dataset_test, batch_size=args.batch_size,
         sampler=test_sampler, num_workers=args.workers, pin_memory=True)
-
-    model = smodels.__dict__[args.model](args.connect_f)
-    print("Creating model")
 
     model.to(device)
     if args.distributed and args.sync_bn:
@@ -210,99 +239,97 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
-
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        state_dict = checkpoint['model']
+        keys1 = list(state_dict.keys())
+        keys2 = list(model_without_ddp.state_dict().keys())
+        for idx in range(len(keys1)):
+            state_dict[keys2[idx]] = state_dict.pop(keys1[idx])
+        model_without_ddp.load_state_dict(state_dict)
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         args.start_epoch = checkpoint['epoch'] + 1
         max_test_acc1 = checkpoint['max_test_acc1']
         test_acc5_at_max_test_acc1 = checkpoint['test_acc5_at_max_test_acc1']
 
-    if args.test_only:
+    evaluate(model, criterion, data_loader_test, device=device, header='Test:')
 
-        evaluate(model, criterion, data_loader_test, device=device, header='Test:')
-
-        return
-
-    if args.tb and utils.is_main_process():
-        purge_step_train = args.start_epoch
-        purge_step_te = args.start_epoch
-        train_tb_writer = SummaryWriter(output_dir + '_logs/train', purge_step=purge_step_train)
-        te_tb_writer = SummaryWriter(output_dir + '_logs/te', purge_step=purge_step_te)
-        with open(output_dir + '_logs/args.txt', 'w', encoding='utf-8') as args_txt:
-            args_txt.write(str(args))
-
-        print(f'purge_step_train={purge_step_train}, purge_step_te={purge_step_te}')
-
-    print("Start training")
-    start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        save_max = False
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        train_loss, train_acc1, train_acc5 = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args.print_freq, scaler, args.T_train)
-        if utils.is_main_process():
-            train_tb_writer.add_scalar('train_loss', train_loss, epoch)
-            train_tb_writer.add_scalar('train_acc1', train_acc1, epoch)
-            train_tb_writer.add_scalar('train_acc5', train_acc5, epoch)
-        lr_scheduler.step()
-
-        test_loss, test_acc1, test_acc5 = evaluate(model, criterion, data_loader_test, device=device, header='Test:')
-        if te_tb_writer is not None:
-            if utils.is_main_process():
-
-                te_tb_writer.add_scalar('test_loss', test_loss, epoch)
-                te_tb_writer.add_scalar('test_acc1', test_acc1, epoch)
-                te_tb_writer.add_scalar('test_acc5', test_acc5, epoch)
-
-
-        if max_test_acc1 < test_acc1:
-            max_test_acc1 = test_acc1
-            test_acc5_at_max_test_acc1 = test_acc5
-            save_max = True
-
-
-        if output_dir:
-
-            checkpoint = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'epoch': epoch,
-                'args': args,
-                'max_test_acc1': max_test_acc1,
-                'test_acc5_at_max_test_acc1': test_acc5_at_max_test_acc1,
-            }
-
-            if save_max:
-                utils.save_on_master(
-                    checkpoint,
-                    os.path.join(output_dir, 'checkpoint_max_test_acc1.pth'))
-        print(args)
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-
-        print('Training time {}'.format(total_time_str), 'max_test_acc1', max_test_acc1, 'test_acc5_at_max_test_acc1', test_acc5_at_max_test_acc1)
-        print(output_dir)
-    if output_dir:
-        utils.save_on_master(
-            checkpoint,
-            os.path.join(output_dir, f'checkpoint_{epoch}.pth'))
-
-    return max_test_acc1
-
+    # if args.tb and utils.is_main_process():
+    #     purge_step_train = args.start_epoch
+    #     purge_step_te = args.start_epoch
+    #     train_tb_writer = SummaryWriter(output_dir + '_logs/train', purge_step=purge_step_train)
+    #     te_tb_writer = SummaryWriter(output_dir + '_logs/te', purge_step=purge_step_te)
+    #     with open(output_dir + '_logs/args.txt', 'w', encoding='utf-8') as args_txt:
+    #         args_txt.write(str(args))
+    #
+    #     print(f'purge_step_train={purge_step_train}, purge_step_te={purge_step_te}')
+    #
+    # print("Start training")
+    # start_time = time.time()
+    # for epoch in range(args.start_epoch, args.epochs):
+    #     save_max = False
+    #     if args.distributed:
+    #         train_sampler.set_epoch(epoch)
+    #     train_loss, train_acc1, train_acc5 = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch,
+    #                                                          args.print_freq, scaler, args.T_train)
+    #     if utils.is_main_process():
+    #         train_tb_writer.add_scalar('train_loss', train_loss, epoch)
+    #         train_tb_writer.add_scalar('train_acc1', train_acc1, epoch)
+    #         train_tb_writer.add_scalar('train_acc5', train_acc5, epoch)
+    #     lr_scheduler.step()
+    #
+    #     test_loss, test_acc1, test_acc5 = evaluate(model, criterion, data_loader_test, device=device, header='Test:')
+    #     if te_tb_writer is not None:
+    #         if utils.is_main_process():
+    #             te_tb_writer.add_scalar('test_loss', test_loss, epoch)
+    #             te_tb_writer.add_scalar('test_acc1', test_acc1, epoch)
+    #             te_tb_writer.add_scalar('test_acc5', test_acc5, epoch)
+    #
+    #     if max_test_acc1 < test_acc1:
+    #         max_test_acc1 = test_acc1
+    #         test_acc5_at_max_test_acc1 = test_acc5
+    #         save_max = True
+    #
+    #     if output_dir:
+    #
+    #         checkpoint = {
+    #             'model': model_without_ddp.state_dict(),
+    #             'optimizer': optimizer.state_dict(),
+    #             'lr_scheduler': lr_scheduler.state_dict(),
+    #             'epoch': epoch,
+    #             'args': args,
+    #             'max_test_acc1': max_test_acc1,
+    #             'test_acc5_at_max_test_acc1': test_acc5_at_max_test_acc1,
+    #         }
+    #
+    #         if save_max:
+    #             utils.save_on_master(
+    #                 checkpoint,
+    #                 os.path.join(output_dir, 'checkpoint_max_test_acc1.pth'))
+    #     print(args)
+    #     total_time = time.time() - start_time
+    #     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    #
+    #     print('Training time {}'.format(total_time_str), 'max_test_acc1', max_test_acc1, 'test_acc5_at_max_test_acc1',
+    #           test_acc5_at_max_test_acc1)
+    #     print(output_dir)
+    # if output_dir:
+    #     utils.save_on_master(
+    #         checkpoint,
+    #         os.path.join(output_dir, f'checkpoint_{epoch}.pth'))
+    #
+    # return max_test_acc1
 
 
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description='PyTorch Classification Training')
-    parser.add_argument('--model', help='model')
+    parser.add_argument('--model', default='SpikingResNet', help='model')
 
-    parser.add_argument('--data-path', help='dataset')
-    parser.add_argument('--device', default='cuda', help='device')
-    parser.add_argument('-b', '--batch-size', default=16, type=int)
+    parser.add_argument('--data-path', default='D:/1/dataset/DVS128Gesture', help='dataset')
+    parser.add_argument('--device', default='cpu', help='device')
+    parser.add_argument('-b', '--batch-size', default=1, type=int)
     parser.add_argument('--epochs', default=90, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -317,7 +344,9 @@ def parse_args():
     parser.add_argument('--lr-gamma', default=0.1, type=float, help='decrease lr by a factor of lr-gamma')
     parser.add_argument('--print-freq', default=64, type=int, help='print frequency')
     parser.add_argument('--output-dir', default='.', help='path where to save')
-    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume',
+                        default='D:/Github/Spike-Element-Wise-ResNet/origin_logs/dvsgesture/checkpoint_max_val_acc1.pth',
+                        help='resume from checkpoint')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument(
@@ -337,7 +366,6 @@ def parse_args():
     parser.add_argument('--amp', action='store_true',
                         help='Use AMP training')
 
-
     # distributed training parameters
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of distributed processes')
@@ -354,7 +382,6 @@ def parse_args():
 
     args = parser.parse_args()
     return args
-
 
 
 if __name__ == "__main__":
