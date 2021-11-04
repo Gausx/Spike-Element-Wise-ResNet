@@ -1,0 +1,1 @@
+Namespace(T=16, T_max=64, T_train=None, amp=False, b=1, cnf='ADD', data_dir='D:/1/dataset', device='cpu', dts_cache='./dts_cache', epochs=64, gamma=0.1, j=4, lr=0.1, lr_scheduler='CosALR', model='SEWResNet', momentum=0.9, opt='SGD', out_dir='./logs', resume='D:/Github/Spike-Element-Wise-ResNet/origin_logs/cifar10dvs/checkpoint_max.pth', step_size=32)
