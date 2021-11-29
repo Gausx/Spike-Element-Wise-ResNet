@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 import sys
 from torch.cuda import amp
-import smodels_firing_num
+# import smodels_firing_num
+import smodels
 import argparse
 from spikingjelly.clock_driven import functional
 from spikingjelly.datasets import cifar10_dvs
@@ -148,7 +149,7 @@ def main():
     start_epoch = 0
     max_test_acc = 0
 
-    net = smodels_firing_num.__dict__[args.model](args.cnf)
+    net = smodels.__dict__[args.model](args.cnf)
     print(net)
     print(get_parameter_number(net))
     net.to(args.device)

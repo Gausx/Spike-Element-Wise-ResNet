@@ -1,16 +1,19 @@
 import datetime
+import math
 import os
 import time
+
+import pandas as pd
 import torch
 import torch.utils.data
-from torch import nn
-from torch.utils.tensorboard import SummaryWriter
-import math
-from torch.cuda import amp
-import smodels_firing_num, utils
 from spikingjelly.clock_driven import functional
 from spikingjelly.datasets import dvs128_gesture
-import pandas as pd
+from torch import nn
+from torch.cuda import amp
+from torch.utils.tensorboard import SummaryWriter
+
+import smodels_firing_num
+import utils
 
 _seed_ = 2020
 import random
@@ -239,6 +242,7 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
+
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
         state_dict = checkpoint['model']
@@ -321,11 +325,10 @@ def main(args):
     #
     # return max_test_acc1
 
-
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description='PyTorch Classification Training')
-    parser.add_argument('--model', default='SpikingResNet', help='model')
+    parser.add_argument('--model', default='SEWResNet', help='model')
 
     parser.add_argument('--data-path', default='D:/1/dataset/DVS128Gesture', help='dataset')
     parser.add_argument('--device', default='cpu', help='device')
@@ -345,7 +348,7 @@ def parse_args():
     parser.add_argument('--print-freq', default=64, type=int, help='print frequency')
     parser.add_argument('--output-dir', default='.', help='path where to save')
     parser.add_argument('--resume',
-                        default='D:/Github/Spike-Element-Wise-ResNet/origin_logs/dvsgesture/checkpoint_max_val_acc1.pth',
+                        default='C:/Users/lenovo/Downloads/checkpoint_max_val_acc1.pth',
                         help='resume from checkpoint')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='start epoch')
@@ -377,8 +380,8 @@ def parse_args():
     parser.add_argument('--adam', action='store_true',
                         help='Use Adam')
 
-    parser.add_argument('--connect_f', type=str, help='element-wise connect function')
-    parser.add_argument('--T_train', type=int)
+    parser.add_argument('--connect_f', default='ADD', type=str, help='element-wise connect function')
+    parser.add_argument('--T_train', default=12, type=int)
 
     args = parser.parse_args()
     return args
